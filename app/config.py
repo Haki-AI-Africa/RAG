@@ -228,6 +228,28 @@ RAG_CHECK_EMBEDDING_CTX_LENGTH = True if env_value == "true" else False
 ## Embeddings
 
 
+def _one_text_per_request(embeddings_cls):
+    """Wrap a langchain Gemini embeddings class so each text is its own request.
+
+    gemini-embedding-2 models treat several texts in one embedContent request
+    as ONE multi-part input and return a single vector, so the default batched
+    embed_documents returned 1 vector for N chunks (verified 2026-11-07 with
+    langchain-google-genai 4.2.0, on both the Gemini API and Vertex AI).
+    batch_size=1 returns one correct vector per text.
+    """
+
+    class OneTextPerRequest(embeddings_cls):
+        def embed_documents(self, texts, **kwargs):
+            kwargs["batch_size"] = 1
+            return super().embed_documents(texts, **kwargs)
+
+        async def aembed_documents(self, texts, **kwargs):
+            kwargs["batch_size"] = 1
+            return await super().aembed_documents(texts, **kwargs)
+
+    return OneTextPerRequest
+
+
 def init_embeddings(provider, model):
     if provider == EmbeddingsProvider.OPENAI:
         from langchain_openai import OpenAIEmbeddings
@@ -272,17 +294,25 @@ def init_embeddings(provider, model):
         kwargs = dict(model=model, google_api_key=RAG_GOOGLE_API_KEY or None)
         if output_dimensionality:
             kwargs["output_dimensionality"] = int(output_dimensionality)
-        return GoogleGenerativeAIEmbeddings(**kwargs)
+        return _one_text_per_request(GoogleGenerativeAIEmbeddings)(**kwargs)
     elif provider == EmbeddingsProvider.GOOGLE_VERTEXAI:
         from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-        return GoogleGenerativeAIEmbeddings(
+        # Authenticates with Application Default Credentials (the Cloud Run
+        # service account). No API key is passed even if one is present in
+        # the environment, so Vertex access is governed only by IAM.
+        kwargs = dict(
             model=model,
-            google_api_key=RAG_GOOGLE_API_KEY or None,
             vertexai=True,
             project=get_env_variable("GOOGLE_CLOUD_PROJECT", None),
             location=get_env_variable("GOOGLE_CLOUD_LOCATION", "us-central1"),
         )
+        # Must match the vector index (e.g. 1536). Without this, Gemini
+        # embedding models return their full 3072 dimensions.
+        output_dimensionality = get_env_variable("EMBEDDINGS_DIMENSIONS", None)
+        if output_dimensionality:
+            kwargs["output_dimensionality"] = int(output_dimensionality)
+        return _one_text_per_request(GoogleGenerativeAIEmbeddings)(**kwargs)
     elif provider == EmbeddingsProvider.BEDROCK:
         from langchain_aws import BedrockEmbeddings
 
